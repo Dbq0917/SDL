@@ -196,11 +196,45 @@ static void AAUDIO_UnblockWaitDevice(SDL_AudioDevice *device)
     }
 }
 
-static bool BuildAAudioStream(SDL_AudioDevice *device);
+static bool BuildAAudioStream(SDL_AudioDevice *device, const SDL_AudioSpec *prevspec, const Uint8 *carryover, size_t carryover_bytes);
 
 static bool RecoverAAudioDevice(SDL_AudioDevice *device)
 {
     struct SDL_PrivateAudioData *hidden = device->hidden;
+
+    const int prev_sample_frames = device->sample_frames;
+    SDL_AudioSpec prevspec;
+    SDL_copyp(&prevspec, &device->spec);
+
+    // Save off any audio that was already mixed/recorded but not yet consumed,
+    // so the new stream can pick up where the dead one left off and we don't
+    // interrupt the data flow.
+    Uint8 *carryover = NULL;
+    size_t carryover_bytes = 0;
+    if (hidden->mixbuf) {
+        if (device->recording) {
+            carryover_bytes = hidden->callback_bytes - hidden->processed_bytes;  // recorded but not yet read.
+        } else {
+            carryover_bytes = hidden->processed_bytes - hidden->callback_bytes;  // mixed but not yet played.
+        }
+        SDL_assert(carryover_bytes <= hidden->mixbuf_bytes);
+        carryover_bytes = SDL_min(carryover_bytes, hidden->mixbuf_bytes);
+        if (carryover_bytes > 0) {
+            carryover = (Uint8 *)SDL_malloc(carryover_bytes);
+            if (carryover) {
+                const size_t offset = device->recording ? hidden->processed_offset : hidden->callback_offset;
+                if ((offset + carryover_bytes) <= hidden->mixbuf_bytes) {
+                    SDL_memcpy(carryover, &hidden->mixbuf[offset], carryover_bytes);
+                } else {
+                    const size_t partial = hidden->mixbuf_bytes - offset;
+                    SDL_memcpy(carryover, &hidden->mixbuf[offset], partial);
+                    SDL_memcpy(&carryover[partial], &hidden->mixbuf[0], carryover_bytes - partial);
+                }
+            } else {
+                carryover_bytes = 0;
+            }
+        }
+    }
 
     // attempt to build a new stream, in case there's a new default device.
     ctx.AAudioStream_requestStop(hidden->stream);
@@ -213,17 +247,16 @@ static bool RecoverAAudioDevice(SDL_AudioDevice *device)
     SDL_DestroySemaphore(hidden->semaphore);
     hidden->semaphore = NULL;
 
-    const int prev_sample_frames = device->sample_frames;
-    SDL_AudioSpec prevspec;
-    SDL_copyp(&prevspec, &device->spec);
-
-    if (!BuildAAudioStream(device)) {
+    if (!BuildAAudioStream(device, &prevspec, carryover, carryover_bytes)) {
+        SDL_free(carryover);
         // Restore the buffer sizes that match the allocated buffers, so we don't crash
         device->sample_frames = prev_sample_frames;
         SDL_copyp(&device->spec, &prevspec);
         SDL_UpdatedAudioDeviceFormat(device);
         return false;  // oh well, we tried.
     }
+
+    SDL_free(carryover);
 
     // we don't know the new device spec until we open the new device, so we saved off the old one and force it back
     // so SDL_AudioDeviceFormatChanged can set up all the important state if necessary and then set it back to the new spec.
@@ -248,6 +281,11 @@ static bool AAUDIO_PlayDevice(SDL_AudioDevice *device, const Uint8 *buffer, int 
     const aaudio_result_t err = (aaudio_result_t) SDL_GetAtomicInt(&hidden->error_callback_triggered);
     if (err) {
         SDL_LogError(SDL_LOG_CATEGORY_AUDIO, "aaudio: Audio device triggered error %d (%s)", (int) err, ctx.AAudio_convertResultToText(err));
+
+        // The buffer we were just handed is already mixed into the ring buffer; count it
+        // as processed, so RecoverAAudioDevice can carry it over to the new stream.
+        hidden->processed_offset = (hidden->processed_offset + buflen) % hidden->mixbuf_bytes;
+        hidden->processed_bytes += buflen;
 
         if (!RecoverAAudioDevice(device)) {
             return false;  // oh well, we went down hard.
@@ -327,7 +365,7 @@ static void SetOptionalStreamUsage(AAudioStreamBuilder *builder)
     }
 }
 
-static bool BuildAAudioStream(SDL_AudioDevice *device)
+static bool BuildAAudioStream(SDL_AudioDevice *device, const SDL_AudioSpec *prevspec, const Uint8 *carryover, size_t carryover_bytes)
 {
     struct SDL_PrivateAudioData *hidden = device->hidden;
     const bool recording = device->recording;
@@ -369,7 +407,10 @@ static bool BuildAAudioStream(SDL_AudioDevice *device)
 
     const bool sample_frames_hint = SDL_GetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES) != NULL;
     int32_t requested_sample_frames;
-    if (sample_frames_hint) {
+    if (sample_frames_hint || prevspec) {
+        // Either the app explicitly asked for a specific buffer size, or we are
+        // rebuilding a stream that already negotiated one; either way, request
+        // the same buffer size again so latency doesn't grow.
         requested_sample_frames = device->sample_frames;
     } else {
         // Use 20 ms for the default audio buffer size
@@ -420,7 +461,7 @@ static bool BuildAAudioStream(SDL_AudioDevice *device)
         device->sample_frames = (int)ctx.AAudioStream_getBufferCapacityInFrames(hidden->stream) / 2;
     }
 
-    if (!recording && sample_frames_hint) {
+    if (!recording && (sample_frames_hint || prevspec)) {
         // It is not enough to set only capacity, buffer size handles latency.
         // Created audio stream can have much larger capacity, than requested by builder.
         // see https://developer.android.com/ndk/guides/audio/aaudio/aaudio#tuning-buffers
@@ -465,7 +506,37 @@ static bool BuildAAudioStream(SDL_AudioDevice *device)
     hidden->processed_offset = 0;
     hidden->processed_bytes = 0;
 
-    hidden->semaphore = SDL_CreateSemaphore(recording ? 0 : hidden->num_buffers - 1);
+    // If we're recovering a dead stream, preload anything that was already
+    // mixed/recorded but not yet consumed, so we don't interrupt the data flow.
+    // This only works if the new stream has the same format as the old one.
+    size_t preloaded_bytes = 0;
+    if (carryover && (carryover_bytes > 0) && prevspec && SDL_AudioSpecsEqual(prevspec, &device->spec, NULL, NULL)) {
+        preloaded_bytes = SDL_min(carryover_bytes, hidden->mixbuf_bytes);
+        if (recording) {
+            // recorded but not yet read; it lives at the front of the buffer.
+            SDL_memcpy(hidden->mixbuf, carryover, preloaded_bytes);
+            hidden->callback_offset = preloaded_bytes % hidden->mixbuf_bytes;
+            hidden->callback_bytes = preloaded_bytes;
+        } else {
+            // mixed but not yet played; it lives at the end of the buffer, so
+            // the writing side of the ring buffer stays aligned to device->buffer_size.
+            SDL_memcpy(&hidden->mixbuf[hidden->mixbuf_bytes - preloaded_bytes], carryover, preloaded_bytes);
+            hidden->callback_offset = (hidden->mixbuf_bytes - preloaded_bytes) % hidden->mixbuf_bytes;
+            hidden->processed_bytes = preloaded_bytes;
+        }
+        SDL_MemoryBarrierRelease();
+    }
+
+    // The semaphore gates how many device->buffer_size chunks the app can fill
+    // (playback) or collect (recording); account for the preloaded data.
+    int initial_semaphore_value;
+    if (recording) {
+        initial_semaphore_value = (int) (preloaded_bytes / device->buffer_size);  // let the app pick up what's already recorded.
+    } else {
+        initial_semaphore_value = SDL_min(hidden->num_buffers - 1, (int) ((hidden->mixbuf_bytes - preloaded_bytes) / device->buffer_size));
+    }
+
+    hidden->semaphore = SDL_CreateSemaphore(initial_semaphore_value);
     if (!hidden->semaphore) {
         LOGI("SDL Failed SDL_CreateSemaphore %s recording:%d", SDL_GetError(), recording);
         return false;
@@ -523,7 +594,7 @@ static bool AAUDIO_OpenDevice(SDL_AudioDevice *device)
         return false;
     }
 
-    return BuildAAudioStream(device);
+    return BuildAAudioStream(device, NULL, NULL, 0);
 }
 
 static bool PauseOneDevice(void *userdata, SDL_AudioDevice *device)
