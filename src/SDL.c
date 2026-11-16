@@ -205,6 +205,7 @@ static SDL_ThreadID SDL_MainThreadID = 0;
 static SDL_ThreadID SDL_EventsThreadID = 0;
 static SDL_ThreadID SDL_VideoThreadID = 0;
 static bool SDL_bInMainQuit = false;
+static bool SDL_bInfoLogged = false;
 static Uint8 SDL_SubsystemRefCount[32];
 
 // Private helper to increment a subsystem's ref counter.
@@ -301,8 +302,6 @@ bool SDL_IsVideoThread(void)
 // Initialize all the subsystems that require initialization before threads start
 void SDL_InitMainThread(void)
 {
-    static bool done_info = false;
-
     // If we haven't done it by now, mark this as the main thread
     if (SDL_MainThreadID == 0) {
         SDL_MainThreadID = SDL_GetCurrentThreadID();
@@ -314,7 +313,7 @@ void SDL_InitMainThread(void)
     SDL_InitFilesystem();
     SDL_CreateEventLock();
 
-    if (!done_info) {
+    if (!SDL_bInfoLogged) {
         const char *value;
 
         value = SDL_GetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING);
@@ -325,7 +324,7 @@ void SDL_InitMainThread(void)
         SDL_LogInfo(SDL_LOG_CATEGORY_SYSTEM, "App ID: %s", value ? value : "<unspecified>");
         SDL_LogInfo(SDL_LOG_CATEGORY_SYSTEM, "SDL revision: %s", SDL_REVISION);
 
-        done_info = true;
+        SDL_bInfoLogged = true;
     }
 }
 
@@ -336,6 +335,12 @@ static void SDL_QuitMainThread(void)
     SDL_QuitTicks();
     SDL_QuitEnvironment();
     SDL_QuitTLSData();
+
+    // Clear all thread state so a subsequent SDL_Init() starts from scratch
+    SDL_MainThreadID = 0;
+    SDL_EventsThreadID = 0;
+    SDL_VideoThreadID = 0;
+    SDL_bInfoLogged = false;
 }
 
 bool SDL_InitSubSystem(SDL_InitFlags flags)
@@ -395,6 +400,7 @@ bool SDL_InitSubSystem(SDL_InitFlags flags)
             SDL_EventsThreadID = SDL_GetCurrentThreadID();
 
             if (!SDL_InitEvents()) {
+                SDL_EventsThreadID = 0;
                 SDL_DecrementSubsystemRefCount(SDL_INIT_EVENTS);
                 goto quit_and_error;
             }
@@ -424,6 +430,7 @@ bool SDL_InitSubSystem(SDL_InitFlags flags)
 #endif
 
             if (!SDL_InitVideo(NULL)) {
+                SDL_VideoThreadID = 0;
                 SDL_DecrementSubsystemRefCount(SDL_INIT_VIDEO);
                 SDL_PushError();
                 SDL_QuitSubSystem(SDL_INIT_EVENTS);
@@ -594,6 +601,11 @@ quit_and_error:
         SDL_PushError();
         SDL_QuitSubSystem(flags_initialized);
         SDL_PopError();
+    }
+    if (SDL_WasInit(0) == 0) {
+        // Nothing survived the failed initialization, so don't leave this
+        // thread registered as the main thread.
+        SDL_MainThreadID = 0;
     }
     return false;
 }
